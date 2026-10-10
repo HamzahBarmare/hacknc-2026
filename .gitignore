@@ -1,8 +1,17 @@
 node_modules
-.env
-.env.local
 dist
 *.log
 .DS_Store
+
+# Secrets — never commit real env files (keep the example template).
+.env
+.env.*
+!.env.example
+
+# Local conversation databases (personal data).
 messages.db
-messages.db-journal
+messages.db-*
+*.db
+*.db-*
+*.sqlite
+*.sqlite3

@@ -1,17 +1,51 @@
 import "./env.ts";
 import { Spectrum } from "spectrum-ts";
-import { imessage } from "@spectrum-ts/imessage";
+import { localIMessage } from "@spectrum-ts/imessage-local";
 import { getMessagesSince, insertMessage, pruneOlderThan, RETENTION_MS } from "./db.ts";
 import { describeWindow, isSummarizeCommand, parseWindowMs } from "./parse.ts";
 import { summarize } from "./summarize.ts";
 
-const app = await Spectrum({
-  projectId: process.env.PROJECT_ID!,
-  projectSecret: process.env.PROJECT_SECRET!,
-  providers: [imessage.config()],
-});
+const app = await Spectrum({ providers: [localIMessage.config()] });
 
-const im = imessage(app);
+const im = localIMessage(app);
+
+// macOS mirrors a message sent from another device on the same account back
+// into chat.db as an "incoming" row (prefixed with "echo: "). Without a guard
+// the bot replies to its own replies forever. Remember what we send and ignore
+// any inbound that matches it.
+const ECHO_TTL_MS = 60_000;
+const recentOutgoing: Array<{ text: string; ts: number }> = [];
+
+function rememberOutgoing(text: string): void {
+  const cutoff = Date.now() - ECHO_TTL_MS;
+  while (recentOutgoing.length > 0 && (recentOutgoing[0]?.ts ?? Infinity) < cutoff) {
+    recentOutgoing.shift();
+  }
+  recentOutgoing.push({ text: text.trim(), ts: Date.now() });
+}
+
+function isLoopbackEcho(text: string): boolean {
+  const normalized = text.replace(/^\s*echo:\s*/i, "").trim();
+  return recentOutgoing.some((entry) => entry.text === normalized);
+}
+
+const allowedSenders = new Set(
+  (process.env.ALLOWED_SENDERS ?? "")
+    .split(",")
+    .map((handle) => handle.trim())
+    .filter(Boolean),
+);
+
+function isAllowed(senderId: string | null): boolean {
+  return allowedSenders.size === 0 || (senderId !== null && allowedSenders.has(senderId));
+}
+
+if (allowedSenders.size === 0) {
+  console.warn(
+    "[safety] ALLOWED_SENDERS is empty — any group member can trigger a summary. " +
+      "Set ALLOWED_SENDERS to a comma-separated list of handles to restrict who can.",
+  );
+}
 
 type DmSpace = Awaited<ReturnType<typeof im.space.create>>;
 const dmSpaces = new Map<string, Promise<DmSpace>>();
@@ -25,6 +59,13 @@ function getDmSpace(userId: string): Promise<DmSpace> {
   return pending;
 }
 
+type Sendable = { send: (content: string) => Promise<unknown> };
+
+async function reply(space: Sendable, text: string): Promise<void> {
+  rememberOutgoing(text);
+  await space.send(text);
+}
+
 pruneOlderThan(Date.now() - RETENTION_MS);
 setInterval(() => {
   const removed = pruneOlderThan(Date.now() - RETENTION_MS);
@@ -36,20 +77,23 @@ setInterval(() => {
 for await (const [space, message] of app.messages) {
   try {
     if (message.direction === "outbound") continue;
-    if (message.platform !== "imessage") continue;
+    if (message.platform !== "local_imessage") continue;
 
-    const imSpace = imessage(space);
+    const imSpace = localIMessage(space);
+    const senderId = message.sender?.id ?? null;
     console.log(
-      `[inbound] space=${imSpace.id} type=${imSpace.type} content=${message.content.type} sender=${message.sender?.id ?? "?"}`,
+      `[inbound] space=${imSpace.id} type=${imSpace.type} content=${message.content.type} sender=${senderId ?? "?"}`,
     );
+    if (!senderId) continue;
 
     if (imSpace.type === "dm") {
-      if (message.content.type === "text") {
+      if (message.content.type === "text" && !isLoopbackEcho(message.content.text)) {
         const dmText = message.content.text.trim().toLowerCase();
-        await space.send(
+        await reply(
+          space,
           dmText === "ping"
-            ? "pong — I'm running on the shared line."
-            : 'I\'m running. Add me to a group chat and say "summarize past 24 hours".',
+            ? "pong — the local summarizer is running."
+            : 'I summarize group chats. In a group, say "summarize past 24 hours".',
         );
       }
       continue;
@@ -59,21 +103,26 @@ for await (const [space, message] of app.messages) {
     if (message.content.type !== "text") continue;
 
     const text = message.content.text;
-    const senderId = message.sender?.id ?? null;
+    if (isLoopbackEcho(text)) continue;
     const ts = message.timestamp ? new Date(message.timestamp).getTime() : Date.now();
 
     insertMessage(space.id, senderId, text, ts);
 
     if (!isSummarizeCommand(text)) continue;
 
+    if (!isAllowed(senderId)) {
+      await reply(space, "This bot is restricted to approved senders.");
+      continue;
+    }
+
     if (!senderId) {
-      await space.send("I can't tell who asked, so I can't DM the summary.");
+      await reply(space, "I can't tell who asked, so I can't DM the summary.");
       continue;
     }
 
     const requested = parseWindowMs(text);
     if (requested === null) {
-      await space.send(`Couldn't read that time window. Try "summarize past 24 hours".`);
+      await reply(space, `Couldn't read that time window. Try "summarize past 24 hours".`);
       continue;
     }
 
@@ -82,18 +131,19 @@ for await (const [space, message] of app.messages) {
     const messages = getMessagesSince(space.id, Date.now() - windowMs);
 
     if (messages.length === 0) {
-      await space.send(`No messages in the last ${label} to summarize.`);
+      await reply(space, `No messages in the last ${label} to summarize.`);
       continue;
     }
 
     await space.responding(async () => {
       const summary = await summarize(messages, label);
       const dm = await getDmSpace(senderId);
-      await dm.send(summary);
+      await reply(dm, summary);
     });
 
     if (windowMs < requested) {
-      await space.send(
+      await reply(
+        space,
         `Note: only the last ${label} were summarized (older messages have been pruned).`,
       );
     }
